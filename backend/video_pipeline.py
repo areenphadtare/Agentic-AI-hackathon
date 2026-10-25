@@ -1,7 +1,7 @@
-"""ArgusGraph adaptive video -> YOLO/CLIP/BLIP -> Gemini -> FalkorDB.
+"""ArgusGraph adaptive video -> YOLO/CLIP/BLIP -> Gemma (JarvisLabs) -> FalkorDB.
 Embeddings are saved to NPZ and never written into FalkorDB.
 """
-import argparse, json, os, re, time
+import argparse, base64, json, os, re, time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -11,14 +11,12 @@ from pydantic import BaseModel, Field
 from ultralytics import YOLO
 from transformers import (CLIPModel, CLIPProcessor, BlipProcessor,
     BlipForConditionalGeneration)
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+from openai import OpenAI
 
-load_dotenv()
-
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_KEY = ""
+# Configure JarvisLabs Gemma directly in this file. Replace the placeholder key.
+JARVISLABS_API_KEY = ""
+JARVISLABS_BASE_URL = "https://models.jarvislabs.net/v1"
+GEMMA_MODEL = "gemma-4-31b-it"
 CLIP_NAME = "openai/clip-vit-base-patch32"
 BLIP_CAPTION_NAME = "Salesforce/blip-image-captioning-base"
 
@@ -133,28 +131,68 @@ def enrich_frame(record, models):
         "gemini_eligible":len(det)>1,"clip_embedding":unit_vector(cv),"blip_embedding":unit_vector(bv)}
 
 
-def gemini_scene(client, record, retries=2):
-    prompt=f'''Analyze this property-security video frame. Return structured scene interpretation.
-Frame ID: {record['frame_id']}; timestamp seconds: {record['timestamp_seconds']}.
-YOLO detections (may be wrong): {json.dumps(record['detections'])}
+def gemma_scene(client, record, retries=2):
+    """Use JarvisLabs-hosted Gemma with the actual frame image for scene understanding."""
+    image_bytes = Path(record["image_path"]).read_bytes()
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:image/jpeg;base64,{image_b64}"
+
+    prompt = f"""Analyze this CCTV/property-security video frame and return ONLY a valid JSON object matching this schema:
+{{"scene_description":"string","scene_type":"string","activities":["string"],"safety_concerns":["string"],"visible_evidence":["string"],"uncertainty":["string"]}}
+
+Frame ID: {record['frame_id']}
+Timestamp seconds: {record['timestamp_seconds']}
+YOLO detections (may be wrong): {json.dumps(record['detections'], ensure_ascii=False)}
 BLIP caption (may be wrong): {record['blip_caption']}
-Only describe visually supported facts. Do not infer criminal intent from appearance.
-Do not claim an event across time from one frame. Separate evidence from uncertainty.'''
-    last_error=None
-    for attempt in range(retries+1):
+
+Rules:
+- Use the image as the primary evidence; detections and caption are supporting clues only.
+- Describe only what is visually supported.
+- Do not infer criminal intent, identity, or relationships from appearance alone.
+- Do not claim an event across time from a single frame.
+- Keep scene_description concise and specific.
+- Put uncertain interpretations in uncertainty.
+- Return JSON only, with no Markdown fences or extra text."""
+
+    last_error = None
+    for attempt in range(retries + 1):
         try:
-            response=client.models.generate_content(model=GEMINI_MODEL,
-                contents=[prompt,types.Part.from_bytes(data=Path(record['image_path']).read_bytes(),mime_type="image/jpeg")],
-                config=types.GenerateContentConfig(response_mime_type="application/json",response_schema=Scene,temperature=0.1))
-            if not response.text: raise RuntimeError("Empty Gemini response")
-            return {"status":"success","scene":Scene.model_validate_json(response.text).model_dump(),"error":None}
+            response = client.chat.completions.create(
+                model=GEMMA_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                }],
+                temperature=0.1,
+                max_tokens=1200,
+            )
+            text = response.choices[0].message.content or ""
+            # Tolerate accidental Markdown fences while still validating the schema.
+            text = text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+            payload = json.loads(text)
+            scene = Scene.model_validate(payload).model_dump()
+            return {"status": "success", "scene": scene, "error": None}
         except Exception as e:
-            last_error=str(e)
-            if attempt<retries: time.sleep(1.5*(attempt+1))
-    return {"status":"fallback_blip_yolo","scene":{
-        "scene_description":record["blip_caption"],"scene_type":"unknown","activities":[],"safety_concerns":[],
-        "visible_evidence":[f"YOLO detected {d['label']} (confidence {d['confidence']})" for d in record["detections"]],
-        "uncertainty":["Gemini failed; fallback uses BLIP caption and YOLO detections."]},"error":last_error}
+            last_error = str(e)
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+
+    return {"status": "fallback_blip_yolo", "scene": {
+        "scene_description": record["blip_caption"],
+        "scene_type": "unknown",
+        "activities": [],
+        "safety_concerns": [],
+        "visible_evidence": [
+            f"YOLO detected {d['label']} (confidence {d['confidence']})"
+            for d in record["detections"]
+        ],
+        "uncertainty": ["Gemma inference failed; fallback uses BLIP caption and YOLO detections."],
+    }, "error": last_error}
 
 
 def ingest_falkordb(graph_name, meta, records):
@@ -265,7 +303,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--video",required=True); p.add_argument("--output-dir",default="argusgraph_output")
     p.add_argument("--graph-name",default="video_graph"); p.add_argument("--no-graph",action="store_true")
-    p.add_argument("--no-gemini",action="store_true"); p.add_argument("--base-interval",type=float,default=1.0)
+    p.add_argument("--no-scene-model", "--no-gemini", dest="no_scene_model", action="store_true", help="Skip JarvisLabs Gemma scene analysis (legacy alias: --no-gemini)"); p.add_argument("--base-interval",type=float,default=1.0)
     p.add_argument("--scan-interval",type=float,default=0.2); p.add_argument("--change-threshold",type=float,default=0.13)
     args=p.parse_args(); video=Path(args.video)
     if not video.exists(): raise FileNotFoundError(f"Video not found: {video}")
@@ -274,38 +312,40 @@ def main():
     if not meta["frames"]: raise RuntimeError("No frames were sampled")
     print(f"Selected {len(meta['frames'])} frames from {meta['duration_seconds']}s video")
     device="cuda" if torch.cuda.is_available() else "cpu"; models=load_models(device)
-    key=os.getenv("GEMINI_API_KEY") or (GEMINI_API_KEY if GEMINI_API_KEY != "PASTE_YOUR_GEMINI_API_KEY_HERE" else None); client=None
-    if not args.no_gemini and key: client=genai.Client(api_key=key)
-    elif not args.no_gemini: print("GEMINI_API_KEY missing; Gemini-eligible frames will use fallback")
+    key=JARVISLABS_API_KEY.strip(); client=None
+    if not args.no_scene_model and key and key != "YOUR_JARVISLABS_API_KEY":
+        client=OpenAI(base_url=JARVISLABS_BASE_URL, api_key=key)
+    elif not args.no_scene_model:
+        print("Set JARVISLABS_API_KEY near the top of this file; Gemma-eligible frames will use fallback")
     records=[]; clip_vecs=[]; blip_vecs=[]
     for i,sampled in enumerate(meta["frames"],1):
         print(f"[{i}/{len(meta['frames'])}] {sampled['frame_id']}")
         r=enrich_frame(sampled,models)
-        if r["gemini_eligible"] and client is not None and not args.no_gemini:
-            g=gemini_scene(client,r)
+        if r["gemini_eligible"] and client is not None and not args.no_scene_model:
+            g=gemma_scene(client,r)
         elif r["gemini_eligible"]:
             g={"status":"fallback_blip_yolo","scene":{"scene_description":r["blip_caption"],"scene_type":"unknown","activities":[],"safety_concerns":[],
                 "visible_evidence":[f"YOLO detected {d['label']} (confidence {d['confidence']})" for d in r["detections"]],
-                "uncertainty":["Gemini skipped/unavailable; BLIP/YOLO fallback used."]},"error":"Gemini disabled or API key missing"}
+                "uncertainty":["Gemma skipped/unavailable; BLIP/YOLO fallback used."]},"error":"Gemma disabled or JARVISLABS_API_KEY is still the placeholder"}
         else: g={"status":"skipped_object_count_le_1","scene":None,"error":None}
-        r["gemini_status"]=g["status"]; r["gemini_error"]=g["error"]; r["gemini_scene"]=g["scene"]
+        r["gemma_status"]=g["status"]; r["gemma_error"]=g["error"]; r["gemma_scene"]=g["scene"]
         clip_vecs.append(r.pop("clip_embedding")); blip_vecs.append(r.pop("blip_embedding")); records.append(r)
     emb_path=emb_dir/f"{meta['video_id']}_embeddings.npz"
     np.savez_compressed(emb_path,frame_ids=np.array([r["frame_id"] for r in records]),
         timestamps=np.array([r["timestamp_seconds"] for r in records],dtype=np.float32),
         clip_embeddings=np.vstack(clip_vecs).astype(np.float32),blip_embeddings=np.vstack(blip_vecs).astype(np.float32))
-    # Graph fields are flattened from Gemini schema for convenient Cypher queries.
+    # Graph fields are flattened from the Gemma scene schema for convenient Cypher queries.
     for r in records:
-        s=r.get("gemini_scene") or {}
+        s=r.get("gemma_scene") or {}
         r["scene_description"]=s.get("scene_description",""); r["scene_type"]=s.get("scene_type","unknown")
         r["activities"]=s.get("activities",[]); r["safety_concerns"]=s.get("safety_concerns",[])
         r["visible_evidence"]=s.get("visible_evidence",[]); r["uncertainty"]=s.get("uncertainty",[])
     write_json(out/"argusgraph_index.json",{**meta,"embedding_file":str(emb_path),"frames":records})
-    write_json(out/"gemini_scenes.json",{"video_id":meta["video_id"],"frames":[{"frame_id":r["frame_id"],"timestamp_seconds":r["timestamp_seconds"],"object_count":r["object_count"],"gemini_status":r["gemini_status"],"scene":r["gemini_scene"],"error":r["gemini_error"]} for r in records if r["gemini_eligible"]]})
+    write_json(out/"gemma_scenes.json",{"video_id":meta["video_id"],"frames":[{"frame_id":r["frame_id"],"timestamp_seconds":r["timestamp_seconds"],"object_count":r["object_count"],"gemma_status":r["gemma_status"],"scene":r["gemma_scene"],"error":r["gemma_error"]} for r in records if r["gemini_eligible"]]})
     if not args.no_graph:
         try: ingest_falkordb(args.graph_name,meta,records)
         except Exception as e: print(f"WARNING: FalkorDB ingestion failed; local outputs are saved. Error: {e}")
-    print("Done. JSON index:",out/"argusgraph_index.json"); print("Gemini scenes:",out/"gemini_scenes.json"); print("Embeddings (outside graph):",emb_path)
+    print("Done. JSON index:",out/"argusgraph_index.json"); print("Gemma scenes:",out/"gemma_scenes.json"); print("Embeddings (outside graph):",emb_path)
 
 if __name__=="__main__": 
     main()
