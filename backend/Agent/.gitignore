@@ -1,0 +1,5 @@
+venv
+.env
+yolo26m.pt
+yolo8n.pt
+mcpenv

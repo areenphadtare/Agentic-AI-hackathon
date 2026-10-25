@@ -1,0 +1,16 @@
+av
+opencv-python
+numpy
+ultralytics
+torch
+transformers
+pillow
+typesafe-sdk
+falkordb
+google-genai
+python-dotenv
+deepagents
+langchain-mcp-adapters==0.3.2
+mcp==1.30.0
+langchain-google-genai
+fastapi
